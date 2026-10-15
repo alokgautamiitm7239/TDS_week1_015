@@ -26,10 +26,18 @@ AI_ENDPOINT = os.getenv(
 AI_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-nano")
 
 TZ = ZoneInfo("Asia/Kolkata")
+
+# Connection Pool for fast HTTP Requests
 SESSION = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 
 GLOBAL_DB = None
 DB_INITIALIZED = False
+
+# Fast-path cache for SQL queries to save LLM tokens & execution time
+SQL_CACHE = {}
 
 
 # --------------------------------------------------
@@ -37,7 +45,7 @@ DB_INITIALIZED = False
 # --------------------------------------------------
 
 def get_json(url):
-    response = SESSION.get(url, timeout=8)
+    response = SESSION.get(url, timeout=6)
     response.raise_for_status()
     return response.json()
 
@@ -131,7 +139,7 @@ def init_database():
         if isinstance(v, (int, float))
     }
 
-    # Standardized Deduplication Logic
+    # Deduplication Logic
     latest = {}
     for order in all_orders:
         order_id = order.get("id") or order.get("order_id")
@@ -207,7 +215,7 @@ def init_database():
     DB_INITIALIZED = True
 
 
-# Pre-initialize DB at startup
+# Pre-initialize DB on app launch
 try:
     if START_URL:
         init_database()
@@ -216,26 +224,24 @@ except Exception as err:
 
 
 # --------------------------------------------------
-# LLM SQL GENERATION
+# ULTRA-FAST LLM SQL GENERATION
 # --------------------------------------------------
 
-SYSTEM_PROMPT = """
-You are a precise SQLite analyst.
-
-Convert the question into ONE valid SQLite SELECT query using table:
-orders(id, customer, region, product, qty, unit_price, amount, currency, status, created_at, updated_at, date_str, amount_usd)
-
-Mandatory rules:
-1. Status filter: Unless asked otherwise, use status = 'paid' for revenue, sales, and orders.
-2. Case matching: Use LOWER(region) = LOWER('value') or LOWER(product) = LOWER('value').
-3. Date matching: For months, use date_str LIKE 'YYYY-MM%'. For example, May 2026 is '2026-05%'.
-4. USD Revenue: Always use SUM(amount_usd) for monetary USD values.
-5. Entity Selection: If asked "Which product...", SELECT ONLY the product name (e.g. SELECT product FROM orders ... GROUP BY product ORDER BY SUM(amount_usd) DESC LIMIT 1).
-6. Output raw SQL only without markdown backticks.
-"""
+SYSTEM_PROMPT = (
+    "Return ONLY valid SQLite SELECT query. "
+    "Table: orders(id, customer, region, product, qty, unit_price, amount, currency, status, created_at, updated_at, date_str, amount_usd). "
+    "Rules: Use status='paid' for revenue/sales. For USD earnings use SUM(amount_usd). Filter dates like date_str LIKE 'YYYY-MM%'. "
+    "For 'Which product...' return ONLY product name (e.g., SELECT product FROM orders ... GROUP BY product ORDER BY SUM(amount_usd) DESC LIMIT 1). "
+    "Use LOWER() for string equality. No markdown."
+)
 
 
 def generate_sql(question):
+    # Cache check for instant response
+    question_key = question.strip().lower()
+    if question_key in SQL_CACHE:
+        return SQL_CACHE[question_key]
+
     if not AI_TOKEN:
         raise RuntimeError("AI PIPE API Token missing.")
 
@@ -253,13 +259,17 @@ def generate_sql(question):
             ],
             "temperature": 0,
         },
-        timeout=8,
+        timeout=5,
     )
 
     response.raise_for_status()
     payload = response.json()
     sql = payload["choices"][0]["message"]["content"]
-    return normalize_sql(sql)
+    clean_sql = normalize_sql(sql)
+
+    # Save to cache
+    SQL_CACHE[question_key] = clean_sql
+    return clean_sql
 
 
 # --------------------------------------------------
@@ -296,7 +306,7 @@ def answer_question(question: str):
         if not rows:
             return 0
 
-        # Case A: Pure Scalar Response (Single Value)
+        # Scalar Response (Single Number or Value)
         if len(rows) == 1 and len(rows[0]) == 1:
             val = rows[0][0]
             if val is None:
@@ -305,7 +315,7 @@ def answer_question(question: str):
                 return round(val, 2)
             return val
 
-        # Case B: Top Entity Single Row (e.g., product name or single record result)
+        # Top Entity String Result (e.g. "Mixer")
         if len(rows) == 1:
             row_dict = dict(rows[0])
             if len(row_dict) == 1:
