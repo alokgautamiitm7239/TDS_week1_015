@@ -1,4 +1,3 @@
-
 import os
 import re
 import sqlite3
@@ -157,17 +156,17 @@ def init_database():
         if order_id is None:
             continue
 
-        order_id = str(order_id)
-        new_time = parse_time(order.get("updated_at"))
+        order_id = str(order_id).strip()
+        new_time = parse_time(order.get("updated_at") or order.get("created_at") or order.get("date"))
 
         if order_id not in latest:
-            latest[order_id] = order
+            latest[order_id] = (new_time, order)
             continue
 
-        old_time = parse_time(latest[order_id].get("updated_at"))
+        old_time = latest[order_id][0]
 
-        if new_time and (old_time is None or new_time > old_time):
-            latest[order_id] = order
+        if new_time and (old_time is None or new_time >= old_time):
+            latest[order_id] = (new_time, order)
 
     # Build in-memory database.
     connection = sqlite3.connect(
@@ -196,8 +195,8 @@ def init_database():
 
     prepared = []
 
-    for order in latest.values():
-        currency = str(order.get("currency") or "USD").upper()
+    for _, order in latest.values():
+        currency = str(order.get("currency") or "USD").upper().strip()
 
         if currency not in rates:
             if currency == "USD":
@@ -222,14 +221,14 @@ def init_database():
         )
 
         prepared.append((
-            str(order.get("id") or order.get("order_id") or ""),
+            str(order.get("id") or order.get("order_id") or "").strip(),
             str(
                 order.get("customer")
                 or order.get("customer_id")
                 or ""
-            ),
-            str(order.get("region") or ""),
-            str(order.get("product") or ""),
+            ).strip(),
+            str(order.get("region") or "").strip(),
+            str(order.get("product") or "").strip(),
             float(order.get("qty") or 0),
             float(order.get("unit_price") or 0),
             amount,
@@ -242,8 +241,10 @@ def init_database():
         ))
 
     connection.executemany("""
-        INSERT INTO orders
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO orders (
+            id, customer, region, product, qty, unit_price, amount,
+            currency, status, created_at, updated_at, date_str, amount_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, prepared)
 
     connection.commit()
@@ -275,30 +276,17 @@ Important rules:
 2. Never invent tables, columns, data, or values.
 3. Use status = 'paid' for paid orders and paid revenue/sales.
 4. Use status = 'refunded' for refunded orders.
-5. Unless the question explicitly asks otherwise, revenue means
-   paid revenue.
+5. Unless the question explicitly asks otherwise, revenue means paid revenue (status = 'paid').
 6. Use SUM(amount_usd) for revenue converted to USD.
-7. Use SUM(amount) for revenue in the original transaction
-   currency only when the currencies are compatible or a currency
-   is specified.
+7. Use SUM(amount) for revenue in original currency only when asked.
 8. COUNT(DISTINCT customer) means distinct customers.
 9. COUNT(DISTINCT id) means distinct orders.
-10. Use product LIKE '%term%' for product-name matching when
-    appropriate. Use LOWER() for case-insensitive matching.
-11. Use date_str for date filters. For a month, use:
-    date_str LIKE 'YYYY-MM%'.
+10. Use product LIKE '%term%' or LOWER(product) = 'term' when suitable.
+11. Use date_str for date filters. For a month like April 2026, use: date_str LIKE '2026-04%'.
 12. For questions about order quantities, use qty.
-13. Do not assume that each row is a unique order.
-14. If a question asks for a single number, return one row with
-    one aggregate value.
-15. For rankings or group comparisons, return the requested
-    grouped results with meaningful column aliases.
-16. Use SQLite-compatible SQL.
-17. Do not use markdown, comments, multiple statements, or
-    write operations.
-18. Interpret the user's question carefully. Do not add filters
-    that the question does not ask for, except the paid-status
-    rule when asking about paid sales/revenue.
+13. If a question asks "Which product...", return ONLY the product column name as the first column in SELECT (e.g., SELECT product FROM orders ... GROUP BY product ORDER BY SUM(amount_usd) DESC LIMIT 1).
+14. Do not include extra metrics in the SELECT clause unless specifically requested alongside the entity.
+15. Use SQLite-compatible SQL without markdown or multiple statements.
 """
 
 
@@ -347,7 +335,6 @@ def answer_question(question: str):
     init_database()
 
     sql = generate_sql(question)
-
     # SQLite authorizer: allow reading only from orders.
     allowed_actions = {
         sqlite3.SQLITE_SELECT,
@@ -375,6 +362,7 @@ def answer_question(question: str):
         if not rows:
             return 0
 
+        # Return single scalar value if query result is 1x1 (e.g., "Mixer" or total amount)
         if len(rows) == 1 and len(rows[0]) == 1:
             value = rows[0][0]
 
@@ -385,6 +373,12 @@ def answer_question(question: str):
                 return round(value, 2)
 
             return value
+
+        # If question asks "Which product...", return just the single name if LIMIT 1
+        if len(rows) == 1:
+            first_val = rows[0][0]
+            if len(rows[0]) == 1 or isinstance(first_val, str):
+                return first_val
 
         return [dict(row) for row in rows]
 
