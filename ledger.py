@@ -1,45 +1,47 @@
 
 import os
 import re
+import sqlite3
 import requests
 from datetime import datetime
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
-# Keep your personalized URL in the START_URL environment variable.
-START_URL = os.environ.get("START_URL")
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
-if not START_URL:
-    raise RuntimeError(
-        "START_URL environment variable is not set."
-    )
+START_URL = os.getenv("START_URL")
+
+AI_TOKEN = (
+    os.getenv("AIPIPE_API_KEY")
+    or os.getenv("AIPIPE_TOKEN")
+    or os.getenv("OPENAI_API_KEY")
+)
+
+AI_ENDPOINT = os.getenv(
+    "AIPIPE_ENDPOINT",
+    "https://aipipe.org/openai/v1/chat/completions"
+)
+
+AI_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4.1-nano")
 
 TZ = ZoneInfo("Asia/Kolkata")
+SESSION = requests.Session()
 
+db = None
+DB_INITIALIZED = False
+
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
 
 def get_json(url):
-    response = requests.get(url, timeout=20)
+    response = SESSION.get(url, timeout=45)
     response.raise_for_status()
     return response.json()
 
-
-# -------------------- LOAD API DATA --------------------
-
-source = get_json(START_URL)
-links = source["links"]
-
-all_orders = []
-url = links["orders"]
-
-while url:
-    page = get_json(url)
-    all_orders.extend(page.get("orders", []))
-    url = page.get("next")
-
-rates_data = get_json(links["rates"])
-rates = rates_data["usd_per_unit"]
-
-
-# -------------------- DATE HANDLING --------------------
 
 def parse_time(value):
     if not value:
@@ -55,346 +57,336 @@ def parse_time(value):
 
         return dt.astimezone(TZ)
 
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
-# -------------------- LATEST ORDER VERSION --------------------
+def normalize_sql(sql):
+    sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE)
+    sql = sql.replace("```", "").strip()
+    sql = sql.rstrip(";").strip()
 
-latest_orders = {}
+    # Allow only read-only SELECT queries and CTEs.
+    if not re.match(r"^(SELECT|WITH)\b", sql, re.IGNORECASE):
+        raise ValueError("Only SELECT queries are allowed.")
 
-for order in all_orders:
-    order_id = order.get("id")
+    # Exactly one statement; reject comments and statement chaining.
+    if ";" in sql or "--" in sql or "/*" in sql or "*/" in sql:
+        raise ValueError("Invalid SQL format.")
 
-    if order_id is None:
-        continue
-
-    previous = latest_orders.get(order_id)
-
-    if previous is None:
-        latest_orders[order_id] = order
-        continue
-
-    previous_time = parse_time(previous.get("updated_at"))
-    current_time = parse_time(order.get("updated_at"))
-
-    if current_time and (
-        previous_time is None or current_time > previous_time
-    ):
-        latest_orders[order_id] = order
-
-orders = list(latest_orders.values())
-
-
-# -------------------- USD CONVERSION --------------------
-
-def amount_usd(order):
-    currency = str(order.get("currency", "USD")).upper()
-    rate = rates.get(currency)
-
-    if rate is None:
-        raise ValueError(
-            f"Missing USD conversion rate for {currency}"
-        )
-
-    amount = float(order.get("amount", 0))
-    return amount * float(rate)
-
-
-for order in orders:
-    order["amount_usd"] = amount_usd(order)
-
-
-# -------------------- AVAILABLE FILTER VALUES --------------------
-
-regions = sorted(
-    {
-        str(o.get("region", "")).strip()
-        for o in orders
-        if o.get("region")
-    },
-    key=len,
-    reverse=True,
-)
-
-products = sorted(
-    {
-        str(o.get("product", "")).strip()
-        for o in orders
-        if o.get("product")
-    },
-    key=len,
-    reverse=True,
-)
-
-months = {
-    "january": 1, "february": 2, "march": 3,
-    "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9,
-    "october": 10, "november": 11, "december": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
-    "jun": 6, "jul": 7, "aug": 8, "sep": 9,
-    "sept": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-
-
-def contains_phrase(question, phrase):
-    """Match a phrase without matching it inside another word."""
-    pattern = r"(?<!\w)" + re.escape(phrase.lower()) + r"(?!\w)"
-    return re.search(pattern, question.lower()) is not None
-
-
-# -------------------- QUESTION FILTERS --------------------
-
-def filter_question_orders(
-    question,
-    base_orders,
-    use_updated_date=False,
-):
-    q = question.lower()
-    result = list(base_orders)
-
-    # Region filter: e.g. North region
-    for region in regions:
-        if contains_phrase(q, region):
-            result = [
-                o for o in result
-                if str(o.get("region", "")).strip().lower()
-                == region.lower()
-            ]
-            break
-
-    # Product filter: e.g. Juicer or Juicers
-    for product in products:
-        matched = contains_phrase(q, product)
-
-        if not matched and not product.lower().endswith("s"):
-            matched = contains_phrase(q, product + "s")
-
-        if matched:
-            result = [
-                o for o in result
-                if str(o.get("product", "")).strip().lower()
-                == product.lower()
-            ]
-            break
-
-    # Month and year filter
-    year_match = re.search(r"\b(20\d{2})\b", q)
-    month_num = None
-
-    for name, number in months.items():
-        if contains_phrase(q, name):
-            month_num = number
-            break
-
-    if year_match and month_num:
-        year = int(year_match.group(1))
-        date_field = (
-            "updated_at" if use_updated_date else "created_at"
-        )
-
-        filtered = []
-
-        for order in result:
-            dt = parse_time(order.get(date_field))
-
-            if (
-                dt is not None
-                and dt.year == year
-                and dt.month == month_num
-            ):
-                filtered.append(order)
-
-        result = filtered
-
-    return result
-
-
-# -------------------- CUSTOMER HELPERS --------------------
-
-def unique_customers(selected):
-    # Ignore differences in capitalization and extra spaces.
-    customers = {}
-
-    for order in selected:
-        name = str(order.get("customer", "")).strip()
-
-        if name:
-            customers.setdefault(name.casefold(), name)
-
-    return customers
-
-
-# -------------------- QUESTION ANSWER ENGINE --------------------
-
-def answer_question(question: str):
-    q = question.lower()
-
-    is_refund = (
-        "refund" in q
-        or "refunded" in q
-        or "refunds" in q
+    forbidden = re.compile(
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|"
+        r"ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|"
+        r"LOAD_EXTENSION|WRITEFILE|READFILE)\b",
+        re.IGNORECASE,
     )
 
-    # Refund questions use the latest order status and updated date.
-    if is_refund:
-        selected = [
-            o for o in orders
-            if str(o.get("status", "")).strip().lower()
-            == "refunded"
-        ]
+    if forbidden.search(sql):
+        raise ValueError("Unsafe SQL operation detected.")
 
-        selected = filter_question_orders(
-            question,
-            selected,
-            use_updated_date=True,
+    return sql
+
+
+# --------------------------------------------------
+# LOAD DATA AND BUILD SQLITE DATABASE
+# --------------------------------------------------
+
+def init_database():
+    global db, DB_INITIALIZED
+
+    if DB_INITIALIZED:
+        return
+
+    if not START_URL:
+        raise RuntimeError(
+            "START_URL environment variable is missing."
         )
 
-        asks_amount = any(
-            word in q
-            for word in ("amount", "value", "revenue", "total", "money")
+    source = get_json(START_URL)
+    links = source.get("links", {})
+
+    if not links.get("orders") or not links.get("rates"):
+        raise RuntimeError("Orders or rates link is missing.")
+
+    # Download every page of orders.
+    all_orders = []
+    next_url = urljoin(START_URL, links["orders"])
+    visited_urls = set()
+
+    while next_url:
+        if next_url in visited_urls:
+            raise RuntimeError("Repeated pagination URL detected.")
+
+        visited_urls.add(next_url)
+        page = get_json(next_url)
+
+        page_orders = page.get("orders")
+        if page_orders is None:
+            page_orders = page.get("data", [])
+
+        if isinstance(page_orders, list):
+            all_orders.extend(page_orders)
+
+        next_page = page.get("next") or page.get("next_page_path")
+        next_url = urljoin(next_url, next_page) if next_page else None
+
+    # Get USD conversion rates.
+    rates_data = get_json(urljoin(START_URL, links["rates"]))
+
+    rates = (
+        rates_data.get("usd_per_unit")
+        or rates_data.get("rates")
+        or rates_data
+    )
+
+    if not isinstance(rates, dict):
+        raise RuntimeError("Invalid currency rates response.")
+
+    rates = {
+        str(currency).upper(): float(rate)
+        for currency, rate in rates.items()
+        if isinstance(rate, (int, float))
+    }
+
+    # Deduplicate orders: retain the latest updated_at version.
+    latest = {}
+
+    for order in all_orders:
+        order_id = order.get("id") or order.get("order_id")
+
+        if order_id is None:
+            continue
+
+        order_id = str(order_id)
+        new_time = parse_time(order.get("updated_at"))
+
+        if order_id not in latest:
+            latest[order_id] = order
+            continue
+
+        old_time = parse_time(latest[order_id].get("updated_at"))
+
+        if new_time and (old_time is None or new_time > old_time):
+            latest[order_id] = order
+
+    # Build in-memory database.
+    connection = sqlite3.connect(
+        ":memory:",
+        check_same_thread=False
+    )
+    connection.row_factory = sqlite3.Row
+
+    connection.execute("""
+        CREATE TABLE orders (
+            id TEXT,
+            customer TEXT,
+            region TEXT,
+            product TEXT,
+            qty REAL,
+            unit_price REAL,
+            amount REAL,
+            currency TEXT,
+            status TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            date_str TEXT,
+            amount_usd REAL
+        )
+    """)
+
+    prepared = []
+
+    for order in latest.values():
+        currency = str(order.get("currency") or "USD").upper()
+
+        if currency not in rates:
+            if currency == "USD":
+                rate = 1.0
+            else:
+                raise RuntimeError(
+                    f"Missing USD conversion rate for {currency}."
+                )
+        else:
+            rate = rates[currency]
+
+        amount = float(order.get("amount") or 0)
+        created = parse_time(
+            order.get("created_at") or order.get("date")
+        )
+        updated = parse_time(order.get("updated_at"))
+
+        date_str = (
+            created.strftime("%Y-%m-%d")
+            if created
+            else ""
         )
 
-        if asks_amount:
-            return round(
-                sum(o["amount_usd"] for o in selected), 2
-            )
+        prepared.append((
+            str(order.get("id") or order.get("order_id") or ""),
+            str(
+                order.get("customer")
+                or order.get("customer_id")
+                or ""
+            ),
+            str(order.get("region") or ""),
+            str(order.get("product") or ""),
+            float(order.get("qty") or 0),
+            float(order.get("unit_price") or 0),
+            amount,
+            currency,
+            str(order.get("status") or "").lower().strip(),
+            created.isoformat() if created else "",
+            updated.isoformat() if updated else "",
+            date_str,
+            amount * rate,
+        ))
 
-        return len(selected)
+    connection.executemany("""
+        INSERT INTO orders
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, prepared)
 
-    # Paid orders are used for revenue, sales, and paid-order questions.
-    paid = [
-        o for o in orders
-        if str(o.get("status", "")).strip().lower() == "paid"
-    ]
+    connection.commit()
 
-    selected = filter_question_orders(question, paid)
+    db = connection
+    DB_INITIALIZED = True
 
-    # Average paid order value
-    if any(
-        word in q
-        for word in ("average", "mean", "avg")
-    ):
-        if not selected:
+
+# --------------------------------------------------
+# NATURAL LANGUAGE TO SQL
+# --------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are a careful SQLite analyst for an order ledger.
+
+Convert the user's question into ONE valid SQLite SELECT query.
+Return only SQL, without markdown or explanations.
+
+Only this table exists:
+
+orders(
+    id, customer, region, product, qty, unit_price, amount,
+    currency, status, created_at, updated_at, date_str, amount_usd
+)
+
+Important rules:
+
+1. Use only the orders table and its listed columns.
+2. Never invent tables, columns, data, or values.
+3. Use status = 'paid' for paid orders and paid revenue/sales.
+4. Use status = 'refunded' for refunded orders.
+5. Unless the question explicitly asks otherwise, revenue means
+   paid revenue.
+6. Use SUM(amount_usd) for revenue converted to USD.
+7. Use SUM(amount) for revenue in the original transaction
+   currency only when the currencies are compatible or a currency
+   is specified.
+8. COUNT(DISTINCT customer) means distinct customers.
+9. COUNT(DISTINCT id) means distinct orders.
+10. Use product LIKE '%term%' for product-name matching when
+    appropriate. Use LOWER() for case-insensitive matching.
+11. Use date_str for date filters. For a month, use:
+    date_str LIKE 'YYYY-MM%'.
+12. For questions about order quantities, use qty.
+13. Do not assume that each row is a unique order.
+14. If a question asks for a single number, return one row with
+    one aggregate value.
+15. For rankings or group comparisons, return the requested
+    grouped results with meaningful column aliases.
+16. Use SQLite-compatible SQL.
+17. Do not use markdown, comments, multiple statements, or
+    write operations.
+18. Interpret the user's question carefully. Do not add filters
+    that the question does not ask for, except the paid-status
+    rule when asking about paid sales/revenue.
+"""
+
+
+def generate_sql(question):
+    if not AI_TOKEN:
+        raise RuntimeError(
+            "AI Pipe token missing. Set AIPIPE_API_KEY."
+        )
+
+    response = SESSION.post(
+        AI_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {AI_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": AI_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            "temperature": 0,
+        },
+        timeout=45,
+    )
+
+    response.raise_for_status()
+    payload = response.json()
+
+    sql = payload["choices"][0]["message"]["content"]
+
+    if not sql:
+        raise RuntimeError("AI returned an empty SQL query.")
+
+    return normalize_sql(sql)
+
+
+# --------------------------------------------------
+# EXECUTE QUESTION
+# --------------------------------------------------
+
+def answer_question(question: str):
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Please provide a question.")
+
+    init_database()
+
+    sql = generate_sql(question)
+
+    # SQLite authorizer: allow reading only from orders.
+    allowed_actions = {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        getattr(sqlite3, "SQLITE_RECURSIVE", -1),
+    }
+
+    def authorize(action, arg1, arg2, database, trigger):
+        if action not in allowed_actions:
+            return sqlite3.SQLITE_DENY
+
+        if action == sqlite3.SQLITE_READ:
+            if arg1 != "orders":
+                return sqlite3.SQLITE_DENY
+
+        return sqlite3.SQLITE_OK
+
+    db.set_authorizer(authorize)
+
+    try:
+        cursor = db.execute(sql)
+        rows = cursor.fetchall()
+
+        if not rows:
             return 0
 
-        return round(
-            sum(o["amount_usd"] for o in selected)
-            / len(selected),
-            2,
-        )
+        if len(rows) == 1 and len(rows[0]) == 1:
+            value = rows[0][0]
 
-    # Customer questions must be handled before product summaries.
-    if "customer" in q or "customers" in q or "client" in q:
-        customer_map = unique_customers(selected)
+            if value is None:
+                return 0
 
-        if any(
-            phrase in q
-            for phrase in (
-                "highest revenue",
-                "most revenue",
-                "top customer",
-                "spent the most",
-                "highest spending",
-            )
-        ):
-            totals = {}
+            if isinstance(value, float):
+                return round(value, 2)
 
-            for order in selected:
-                name = str(order.get("customer", "")).strip()
+            return value
 
-                if name:
-                    key = name.casefold()
-                    totals[key] = (
-                        totals.get(key, 0)
-                        + order["amount_usd"]
-                    )
+        return [dict(row) for row in rows]
 
-            if not totals:
-                return None
-
-            top_key = max(totals, key=totals.get)
-            return customer_map.get(top_key, top_key)
-
-        if any(
-            phrase in q
-            for phrase in (
-                "how many",
-                "count",
-                "number of",
-                "different customers",
-                "unique customers",
-            )
-        ):
-            return len(customer_map)
-
-        return {
-            "count": len(customer_map),
-            "customers": sorted(customer_map.values()),
-        }
-
-    # Product revenue and ranking questions
-    if "product" in q or "products" in q or "item" in q:
-        totals = {}
-
-        for order in selected:
-            name = str(order.get("product", "")).strip()
-
-            if name:
-                totals[name] = (
-                    totals.get(name, 0)
-                    + order["amount_usd"]
-                )
-
-        if any(
-            phrase in q
-            for phrase in (
-                "highest revenue",
-                "most revenue",
-                "top product",
-                "best selling product",
-                "best-selling product",
-            )
-        ):
-            if not totals:
-                return None
-
-            return max(totals, key=totals.get)
-
-        return {
-            name: round(value, 2)
-            for name, value in sorted(
-                totals.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-        }
-
-    # Order count
-    if any(
-        phrase in q
-        for phrase in (
-            "how many orders",
-            "number of orders",
-            "count of orders",
-            "order count",
-        )
-    ):
-        return len(selected)
-
-    # Revenue / sales
-    if any(
-        word in q
-        for word in (
-            "revenue",
-            "sales",
-            "paid order value",
-            "total value",
-        )
-    ):
-        return round(
-            sum(o["amount_usd"] for o in selected), 2
-        )
-
-    return "I could not identify the requested calculation."
+    finally:
+        db.set_authorizer(None)
