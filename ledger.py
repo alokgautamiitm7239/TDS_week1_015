@@ -140,6 +140,8 @@ def answer_question(question: str):
         selected = filter_question_orders(
             question, selected, use_updated_date=True
         )
+        print("Filtered orders:", len(selected))
+        print("Regions:", sorted(set(o.get("region") for o in selected)))
 
         if any(word in q for word in ("amount", "value", "revenue", "total")):
             return round(sum(o["amount_usd"] for o in selected), 2)
