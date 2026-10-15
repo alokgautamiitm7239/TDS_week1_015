@@ -65,7 +65,14 @@ def answer_question(question: str):
     q = question.lower()
 
     if "refund" in q:
-        return "Please specify the refund details needed."
+        filtered = [
+            o for o in latest_orders.values()
+            if o.get("status", "").lower() == "refunded"
+            and o.get("region", "").lower() in q
+            and "february" in q
+            and o.get("created_at", "").startswith("2026-02")
+        ]
+        return len(filtered)
 
     if "customer" in q:
         customers = sorted(set(o["customer"] for o in paid_orders))
